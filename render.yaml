@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: bg-remover-api
+    runtime: python
+    plan: free
+    region: oregon
+    branch: main
+    rootDir: backend
+    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "gunicorn main:app -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT --workers 2 --timeout 120"
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: FAL_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "https://remove.b-magnet.co.il,https://www.remove.b-magnet.co.il"
+      - key: PYTHON_VERSION
+        value: "3.11.9"
