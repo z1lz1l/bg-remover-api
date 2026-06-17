@@ -4,6 +4,7 @@ BG Remover API - simple, minimal FastAPI service for the customer-facing site.
 Provides a single batch endpoint that uploads images to FAL.AI's
 pixelcut/background-removal model in parallel and returns the processed PNGs.
 """
+import base64
 import os
 import uuid
 import logging
@@ -11,7 +12,7 @@ from typing import List
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from remover import process_batch
@@ -23,7 +24,6 @@ from config import FAL_KEY as DEFAULT_FAL_KEY
 # --------------------------------------------------------------------------- #
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-PROCESSED_DIR = os.path.join(BASE_DIR, "processed")
 FRONTEND_DIR = os.path.join(BASE_DIR, "frontend", "dist")
 
 ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -32,7 +32,6 @@ MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB per image
 MAX_BATCH = 50
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(PROCESSED_DIR, exist_ok=True)
 
 logger = logging.getLogger("bg-remover")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -190,16 +189,14 @@ async def process_batch_endpoint(files: List[UploadFile] = File(default=[])):
             detail=f"Background removal service failed: {e}",
         )
 
-    # Write processed PNGs and build response
+    # Encode processed PNGs as base64 data URLs and build response
     response_items: list[dict] = []
     for item, png_bytes in zip(items, results):
-        processed_path = os.path.join(PROCESSED_DIR, item["processed_filename"])
-        with open(processed_path, "wb") as f:
-            f.write(png_bytes)
+        data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
         response_items.append({
             "id": item["id"],
             "original_name": item["original_name"],
-            "processed_url": f"/processed/{item['processed_filename']}",
+            "data_url": data_url,
             "download_name": os.path.splitext(item["original_name"])[0] + "_no_bg.png",
         })
         # Remove the now-unused upload
@@ -212,20 +209,9 @@ async def process_batch_endpoint(files: List[UploadFile] = File(default=[])):
 
 
 # --------------------------------------------------------------------------- #
-# Static files - served via a route handler so the directory is resolved
-# at request time (lets tests swap the directory safely).
+# Static files - the frontend is built into ../frontend/dist and served as
+# the SPA root below.
 # --------------------------------------------------------------------------- #
-@app.get("/processed/{filename}")
-async def serve_processed(filename: str):
-    """Serve processed files from the current PROCESSED_DIR."""
-    # Prevent path traversal
-    if "/" in filename or "\\" in filename or filename.startswith("."):
-        raise HTTPException(status_code=400, detail="Invalid filename.")
-    path = os.path.join(PROCESSED_DIR, filename)
-    if not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="File not found.")
-    return FileResponse(path, media_type="image/png")
-
 if os.path.exists(FRONTEND_DIR):
     app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
     logger.info("Serving frontend from: %s", FRONTEND_DIR)
