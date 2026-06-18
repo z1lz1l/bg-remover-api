@@ -1,21 +1,32 @@
 """
-Background removal using FAL.AI's pixelcut/background-removal model.
+Background removal using FAL.AI's pixelcut/background-removal model, with
+an optional local-backend fast path.
 
-Uses asynchronous batch processing to handle multiple images efficiently.
+The local backend is just another HTTP service (the one run by
+local_server.py) that exposes a /api/process endpoint and returns the
+same JSON envelope. If the env var LOCAL_BACKEND_URL is set and the
+local service responds, we use it; otherwise we fall back to FAL.AI.
 """
 import os
 import re
 import asyncio
 import base64
+import logging
 import httpx
 import fal_client
 
+
+logger = logging.getLogger("bg-remover")
 
 # FAL.AI model endpoint
 FAL_MODEL = "pixelcut/background-removal"
 
 # data:[<mediatype>];base64,<data>  OR  data:[<mediatype>],<data>
 _DATA_URL_RE = re.compile(r"^data:([^;,]+)(?:;base64)?,(.*)$", re.DOTALL)
+
+# Tunables for the local backend
+LOCAL_HEALTH_TIMEOUT_S = 2.5
+LOCAL_PROCESS_TIMEOUT_S = 120.0
 
 
 def _decode_data_url(url: str) -> bytes:
@@ -95,3 +106,87 @@ async def process_batch(
 
         tasks = [_run(p) for p in file_paths]
         return await asyncio.gather(*tasks)
+
+
+# --------------------------------------------------------------------------- #
+# Local-backend fast path
+# --------------------------------------------------------------------------- #
+def _local_backend_url() -> str:
+    return (os.environ.get("LOCAL_BACKEND_URL") or "").strip().rstrip("/")
+
+
+async def _local_backend_alive(url: str) -> bool:
+    """Quick health check against the local backend. Returns False on any error."""
+    if not url:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=LOCAL_HEALTH_TIMEOUT_S) as client:
+            r = await client.get(f"{url}/api/health")
+            return r.status_code == 200
+    except Exception as e:
+        logger.info("Local backend %s not reachable: %s", url, e)
+        return False
+
+
+async def _process_single_local(
+    client: httpx.AsyncClient,
+    local_url: str,
+    file_path: str,
+    original_name: str,
+) -> bytes:
+    """Send one image to the local backend and return the raw PNG bytes."""
+    with open(file_path, "rb") as f:
+        data = f.read()
+    files = {"files": (original_name, data, "application/octet-stream")}
+    r = await client.post(
+        f"{local_url}/api/process",
+        files=files,
+        timeout=LOCAL_PROCESS_TIMEOUT_S,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    items = payload.get("items") or []
+    if not items:
+        raise RuntimeError("Local backend returned no items")
+    data_url = items[0].get("data_url") or ""
+    if not data_url.startswith("data:"):
+        raise RuntimeError("Local backend response missing data_url")
+    return _decode_data_url(data_url)
+
+
+async def process_batch_local(
+    items: list[dict],
+    max_concurrency: int = 4,
+) -> list[bytes] | None:
+    """
+    Try to process a batch through the configured local backend.
+
+    `items` is a list of {upload_path, original_name} dicts (same shape used
+    in main.py). Returns a list of raw PNG bytes in the same order, or
+    `None` if the local backend is unavailable / returned an error.
+    """
+    local_url = _local_backend_url()
+    if not local_url:
+        return None
+    if not await _local_backend_alive(local_url):
+        return None
+
+    logger.info("Using local backend at %s", local_url)
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async with httpx.AsyncClient(timeout=LOCAL_PROCESS_TIMEOUT_S) as client:
+        async def _run(it: dict) -> bytes:
+            async with semaphore:
+                return await _process_single_local(
+                    client,
+                    local_url,
+                    it["upload_path"],
+                    it["original_name"],
+                )
+
+        try:
+            tasks = [_run(it) for it in items]
+            return await asyncio.gather(*tasks)
+        except Exception as e:
+            logger.warning("Local backend failed, will fall back to FAL.AI: %s", e)
+            return None

@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from remover import process_batch
+from remover import process_batch, process_batch_local
 from config import FAL_KEY as DEFAULT_FAL_KEY
 
 
@@ -173,21 +173,48 @@ async def process_batch_endpoint(files: List[UploadFile] = File(default=[])):
             "processed_filename": f"{file_id}_no_bg.png",
         })
 
-    # Run the FAL.AI batch
+    # Run the batch - try local first, fall back to FAL.AI on any error
+    backend_used = "local"
     try:
-        results = await process_batch(saved_paths, fal_key)
+        # Local fast path: only attempted if LOCAL_BACKEND_URL is set and reachable.
+        # We only need the upload paths and original names for the local backend.
+        local_items = [
+            {"upload_path": it["upload_path"], "original_name": it["original_name"]}
+            for it in items
+        ]
+        results = await process_batch_local(local_items)
     except Exception as e:
-        logger.exception("Batch processing failed")
-        # Cleanup uploads
-        for p in saved_paths:
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        raise HTTPException(
-            status_code=502,
-            detail=f"Background removal service failed: {e}",
-        )
+        logger.warning("Local backend threw, falling back to FAL.AI: %s", e)
+        results = None
+
+    if results is None:
+        backend_used = "fal"
+        fal_key = _get_fal_key()
+        if not fal_key:
+            for p in saved_paths:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            raise HTTPException(
+                status_code=500,
+                detail="FAL_KEY is not configured on the server. Set the FAL_KEY environment variable.",
+            )
+        try:
+            results = await process_batch(saved_paths, fal_key)
+        except Exception as e:
+            logger.exception("Batch processing failed")
+            for p in saved_paths:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            raise HTTPException(
+                status_code=502,
+                detail=f"Background removal service failed: {e}",
+            )
+
+    logger.info("Batch processed via %s backend: %d items", backend_used, len(results))
 
     # Encode processed PNGs as base64 data URLs and build response
     response_items: list[dict] = []
